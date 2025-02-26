@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.cuda.amp import autocast, GradScaler
-from transformers import RobertaTokenizer, RobertaForMaskedLM, AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers import RobertaTokenizer, RobertaForMaskedLM, AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, AutoTokenizer, AutoModelForMaskedLM
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 import numpy as np
@@ -21,6 +21,8 @@ import random
 import gc
 import signal
 import math
+import platform
+import shutil
 
 # Set up logging
 logging.basicConfig(
@@ -107,14 +109,14 @@ def load_data(data_file, tokenizer, cache_dir="./cache", max_length=128, validat
     logger.info(f"Validation dataset: Starting from line {val_lines_to_skip:,}")
     
     # Log important statistics about dataset size and examples
-    num_columns = train_dataset.estimated_examples_per_line
+    avg_examples_per_line = train_dataset.total_examples / train_dataset.line_count if train_dataset.line_count > 0 else 0
     total_examples = train_dataset.total_examples
     train_examples = int(total_examples * (1 - validation_split))
     val_examples = int(total_examples * validation_split)
     
     logger.info(f"Dataset statistics:")
     logger.info(f"  Total lines: {train_dataset.line_count:,}")
-    logger.info(f"  Average examples (columns) per line: {num_columns:.2f}")
+    logger.info(f"  Average examples (columns) per line: {avg_examples_per_line:.2f}")
     logger.info(f"  Estimated total examples: {total_examples:,}")
     logger.info(f"  Training examples: ~{train_examples:,}")
     logger.info(f"  Validation examples: ~{val_examples:,}")
@@ -182,12 +184,21 @@ def load_data(data_file, tokenizer, cache_dir="./cache", max_length=128, validat
     elapsed_time = time.time() - start_time
     logger.info(f"Dataset preparation completed in {elapsed_time:.2f} seconds")
     
-    # Log dataloader details
+    # Calculate estimated number of batches for logging
+    # Use math.ceil to ensure we round up to include all data
+    estimated_train_batches = math.ceil(train_examples / batch_size)
+    estimated_val_batches = math.ceil(val_examples / batch_size)
+    
+    # Log dataloader details (using estimated values)
     logger.info(f"Created dataloaders with:")
-    logger.info(f"  Training batches: {len(train_dataloader):,}")
-    logger.info(f"  Validation batches: {len(val_dataloader):,}") 
+    logger.info(f"  Estimated training batches: {estimated_train_batches:,}")
+    logger.info(f"  Estimated validation batches: {estimated_val_batches:,}") 
     logger.info(f"  Batch size: {batch_size}")
-    logger.info(f"  Total training capacity: {len(train_dataloader) * batch_size:,} examples")
+    logger.info(f"  Total training capacity: {estimated_train_batches * batch_size:,} examples")
+    
+    # Store the estimated number of batches in the dataloader objects for later use
+    train_dataloader.num_batches = estimated_train_batches
+    val_dataloader.num_batches = estimated_val_batches
     
     return train_dataloader, val_dataloader
 
@@ -329,7 +340,7 @@ def validate(model, dataloader, device):
     model.train()
     return avg_loss, total_tokens
 
-def save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=False):
+def save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=False, step=None):
     """Save a training checkpoint."""
     checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -349,13 +360,36 @@ def save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=Fal
         'args': vars(args)
     }
     
-    if best:
+    if step is not None:
+        checkpoint['step'] = step
+        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}_step_{step}.pt")
+    elif best:
         checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
     else:
         checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
     
     torch.save(checkpoint, checkpoint_path)
     logger.info(f"Checkpoint saved to {checkpoint_path}")
+    
+    # If this is a step checkpoint, also save the tokenizer
+    if step is not None:
+        tokenizer_dir = os.path.join(checkpoint_dir, f"tokenizer_epoch_{epoch}_step_{step}")
+        if hasattr(model, 'module'):
+            model.module.config.save_pretrained(tokenizer_dir)
+        else:
+            model.config.save_pretrained(tokenizer_dir)
+        
+        try:
+            tokenizer = args.tokenizer if hasattr(args, 'tokenizer') else None
+            if tokenizer is None and 'model_name' in checkpoint['args']:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(checkpoint['args']['model_name'])
+            
+            if tokenizer is not None:
+                tokenizer.save_pretrained(tokenizer_dir)
+                logger.info(f"Tokenizer saved to {tokenizer_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to save tokenizer: {e}")
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     """Load a checkpoint and return the epoch to start from."""
@@ -546,91 +580,46 @@ def main(args):
     # Set up output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # If multiprocessing is disabled, set num_workers to 0
-    if args.disable_multiprocessing:
-        logger.info("Multiprocessing disabled via command line option")
-        args.num_workers = 0
-        
-    # Initialize Weights & Biases with more complete configuration
-    if not args.disable_wandb:
-        wandb.init(
-            project="synthea_train",
-            name=f"run_{time.strftime('%Y%m%d_%H%M%S')}",
-            config=vars(args),
-            # Add tags for easier filtering
-            tags=["synthea", f"model-{args.model_name.split('/')[-1]}", f"workers-{args.num_workers}"]
-        )
-        # Log system info
-        wandb.config.update({
-            "system": {
-                "python_version": sys.version,
-                "torch_version": torch.__version__,
-                "gpu_available": torch.cuda.is_available(),
-                "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
-            }
-        })
-        
-        # Set up custom W&B panels/charts
-        wandb.define_metric("epoch")
-        # Define train loss as grouped with epoch
-        wandb.define_metric("epoch/*", step_metric="epoch")
-        # Define validation metrics grouped with epoch
-        wandb.define_metric("validation/*", step_metric="epoch")
-        # Define training step metrics
-        wandb.define_metric("global_step")
-        wandb.define_metric("train/*", step_metric="global_step")
+    # Set up TensorBoard writer
+    try:
+        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tensorboard"))
+        tensorboard_enabled = True
+        logger.info(f"TensorBoard logs will be saved to {os.path.join(args.output_dir, 'tensorboard')}")
+    except Exception as e:
+        logger.warning(f"Failed to initialize TensorBoard: {e}")
+        tensorboard_enabled = False
+        writer = None
+        logger.info("Training will continue without TensorBoard logging")
     
-    # Set up TensorBoard
-    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tensorboard"))
-    
-    # Set up device
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
+    # Check if CUDA is available and set device
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Set up mixed precision scaler
-    scaler = GradScaler(enabled=args.mixed_precision)
+    if device.type == 'cuda':
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"CUDA Version: {torch.version.cuda}")
+        
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    np.random.seed(42)
+    random.seed(42)
     
-    # Load tokenizer and model
-    logger.info(f"Loading tokenizer and model from {args.model_name}")
-    tokenizer = RobertaTokenizer.from_pretrained(args.model_name)
-    model = RobertaForMaskedLM.from_pretrained(args.model_name)
+    # Load tokenizer
+    logger.info(f"Loading tokenizer from {args.model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     
-    # Add tab token
+    # Add special token for tab character
     special_tokens = {'additional_special_tokens': ['<tab>']}
     tokenizer.add_special_tokens(special_tokens)
-    logger.info(f"Added <tab> special token (ID: {tokenizer.convert_tokens_to_ids('<tab>')})")
-    model.resize_token_embeddings(len(tokenizer))
-    
-    # Compile the model if enabled and supported
-    if args.compile and TORCH_COMPILE_SUPPORTED:
-        logger.info("Compiling model with torch.compile for faster training...")
-        try:
-            # Select the appropriate mode based on the backend
-            if args.compile_mode == "auto":
-                compile_mode = "default"  # Let PyTorch choose the best mode
-            else:
-                compile_mode = args.compile_mode
-                
-            model = torch.compile(
-                model, 
-                mode=compile_mode,
-                fullgraph=False  # Set to False for HuggingFace models
-            )
-            logger.info(f"Model successfully compiled with mode: {compile_mode}")
-        except Exception as e:
-            logger.error(f"Model compilation failed: {str(e)}")
-            logger.warning("Continuing with uncompiled model")
-    elif args.compile and not TORCH_COMPILE_SUPPORTED:
-        logger.warning("Model compilation requested but torch.compile is not supported in this PyTorch version")
-        logger.warning("Continuing with uncompiled model")
-    
-    # Load data
+    logger.info(f"Added <tab> special token (ID: {tokenizer.convert_tokens_to_ids('<tab>')}")
+
+    # Load and process data
     logger.info("Loading and processing dataset...")
-    start_time = time.time()
     train_dataloader, val_dataloader = load_data(
-        args.data_file, 
-        tokenizer, 
+        args.data_file,
+        tokenizer,
         cache_dir=args.cache_dir,
         max_length=args.max_length,
         validation_split=args.validation_split,
@@ -638,215 +627,173 @@ def main(args):
         sample_percentage=args.sample_percentage,
         max_rows=args.max_rows
     )
-    data_load_time = time.time() - start_time
-    
-    # Report detailed dataset statistics
-    logger.info(f"Dataset processing completed in {data_load_time:.2f} seconds")
-    logger.info(f"Training batches: {len(train_dataloader)}, Validation batches: {len(val_dataloader)}")
-    logger.info(f"Batch size: {args.batch_size}, Total training examples: {len(train_dataloader) * args.batch_size}")
-    
-    # Set up optimizer with learning rates from command line arguments
-    initial_lr = args.initial_lr
-    final_lr = args.final_lr
-    
-    # Log the learning rate settings
-    logger.info(f"Setting up cosine learning rate schedule: initial={initial_lr}, final={final_lr}")
-    optimizer = AdamW(model.parameters(), lr=initial_lr, weight_decay=args.weight_decay)
-    
-    total_steps = len(train_dataloader) * args.num_epochs
-    
-    # Validate and adjust warmup ratio if necessary
-    if args.warmup_ratio <= 0 or args.warmup_ratio >= 1:
-        logger.warning(f"Invalid warmup ratio {args.warmup_ratio}, setting to default 0.1")
-        args.warmup_ratio = 0.1
-    elif args.warmup_ratio > 0.2:
-        logger.warning(f"Warmup ratio {args.warmup_ratio} is quite large. For most training scenarios, " 
-                      f"0.05-0.1 is recommended. Setting to 0.1.")
-        args.warmup_ratio = 0.1
 
-    warmup_steps = int(total_steps * args.warmup_ratio)
+    # Load model
+    logger.info(f"Loading model from {args.model_name}")
+    model = AutoModelForMaskedLM.from_pretrained(args.model_name)
     
-    # Warn if warmup steps seem excessive
-    if warmup_steps > total_steps / 3:
-        logger.warning(f"Warmup steps ({warmup_steps}) is more than 1/3 of total steps ({total_steps}). "
-                      f"This may cause the learning rate to increase for too long.")
-        
-    logger.info(f"Learning rate warmup: {warmup_steps}/{total_steps} steps ({args.warmup_ratio:.1%} of training)")
+    # Resize token embeddings to account for new special tokens
+    model.resize_token_embeddings(len(tokenizer))
     
-    # Calculate the min_lr_ratio (final_lr / initial_lr)
-    min_lr_ratio = final_lr / initial_lr
-    
-    # Use custom scheduler to ensure we reach exactly final_lr
-    scheduler = get_cosine_with_hard_restarts_schedule_with_min_lr(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-        min_lr_ratio=min_lr_ratio  # This ensures we decay to exactly final_lr
-    )
-    
-    # Log the scheduler change
-    logger.info(f"Using custom cosine learning rate scheduler with warmup ({warmup_steps} steps)")
-    logger.info(f"Learning rate will start at {initial_lr} and decay to exactly {final_lr}")
-    
-    # Check expected learning rate at key points to verify scheduler is working correctly
-    test_steps = [0, warmup_steps // 2, warmup_steps, 
-                  warmup_steps + (total_steps - warmup_steps) // 4,
-                  warmup_steps + (total_steps - warmup_steps) // 2,
-                  total_steps - 1]
-                  
-    logger.info("Verifying learning rate schedule at key steps:")
-    
-    # Create a test scheduler for verification
-    test_optimizer = AdamW([torch.nn.Parameter(torch.zeros(1))], lr=initial_lr)
-    test_scheduler = get_cosine_with_hard_restarts_schedule_with_min_lr(
-        test_optimizer, 
-        num_warmup_steps=warmup_steps, 
-        num_training_steps=total_steps,
-        min_lr_ratio=min_lr_ratio
-    )
-    
-    # Test different steps and log the expected learning rate
-    for step in test_steps:
-        # Move scheduler to this step
-        for _ in range(step):
-            test_scheduler.step()
-        current_lr = test_scheduler.get_last_lr()[0]
-        
-        if step < warmup_steps:
-            phase = "warmup"
-        else:
-            phase = "decay"
-            
-        logger.info(f"  Step {step:5d} ({phase}): lr = {current_lr:.8f}")
-        
-        # Reset scheduler for next test
-        test_optimizer = AdamW([torch.nn.Parameter(torch.zeros(1))], lr=initial_lr)
-        test_scheduler = get_cosine_with_hard_restarts_schedule_with_min_lr(
-            test_optimizer, 
-            num_warmup_steps=warmup_steps, 
-            num_training_steps=total_steps,
-            min_lr_ratio=min_lr_ratio
-        )
-        
-    # Visualize the learning rate schedule
-    if not args.disable_wandb:
-        # Generate the learning rate schedule for visualization
-        # Sample fewer points for efficiency (100 points total)
-        lr_schedule = []
-        sample_points = min(100, total_steps)  # Don't sample more than 100 points
-        step_size = max(1, total_steps // sample_points)
-        
-        # Create a temporary scheduler for visualization
-        temp_optimizer = AdamW([torch.nn.Parameter(torch.zeros(1))], lr=initial_lr)
-        temp_scheduler = get_cosine_with_hard_restarts_schedule_with_min_lr(
-            temp_optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            min_lr_ratio=min_lr_ratio
-        )
-        
-        # Sample points from the schedule
-        for step in range(0, total_steps, step_size):
-            # Fast-forward the scheduler
-            for _ in range(step):
-                temp_scheduler.step()
-            # Get the current learning rate
-            current_lr = temp_scheduler.get_last_lr()[0]
-            lr_schedule.append([step, current_lr])
-            
-            # Reset scheduler for next sample
-            temp_optimizer = AdamW([torch.nn.Parameter(torch.zeros(1))], lr=initial_lr)
-            temp_scheduler = get_cosine_with_hard_restarts_schedule_with_min_lr(
-                temp_optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps,
-                min_lr_ratio=min_lr_ratio
-            )
-            
-        # Ensure we capture key points for accurate visualization
-        # Start, end of warmup, middle, and end of training
-        key_points = [
-            (0, initial_lr * (0.0/max(1, warmup_steps))),  # Start of training (near 0)
-            (warmup_steps//2, initial_lr * (0.5)),         # Middle of warmup
-            (warmup_steps, initial_lr),                    # End of warmup (peak learning rate)
-            (total_steps, final_lr)                        # End of training
-        ]
-        
-        for step, lr in key_points:
-            lr_schedule.append([step, lr])
-        
-        # Sort and deduplicate points
-        lr_schedule = sorted(lr_schedule, key=lambda x: x[0])
-        lr_schedule = [lr_schedule[i] for i in range(len(lr_schedule)) 
-                      if i == 0 or lr_schedule[i][0] != lr_schedule[i-1][0]]
-        
-        # Log the learning rate schedule to wandb
-        lr_table = wandb.Table(data=lr_schedule, columns=["step", "learning_rate"])
-        wandb.log({
-            "lr_schedule": wandb.plot.line(
-                lr_table, "step", "learning_rate", title="Learning Rate Schedule")
-        })
+    # Apply model compilation if enabled and available
+    if args.compile and TORCH_COMPILE_SUPPORTED:
+        logger.info(f"Compiling model with mode: {args.compile_mode}")
+        model = torch.compile(model, mode=args.compile_mode)
+    elif args.compile and not TORCH_COMPILE_SUPPORTED:
+        logger.warning("Model compilation requested but not supported by PyTorch version. Skipping.")
     
     # Move model to device
-    model = model.to(device)
+    model.to(device)
     
-    # Training state
+    # Set up optimizer with weight decay for non-bias/LayerNorm weights
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {
+            'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            'weight_decay': args.weight_decay
+        },
+        {
+            'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0
+        }
+    ]
+    
+    # Set up optimizer
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    
+    # Set up learning rate scheduler with warmup and cosine decay
+    total_steps = train_dataloader.num_batches * args.num_epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    
+    # Use a minimum learning rate to prevent it from getting too small
+    min_lr = args.final_lr
+    
+    scheduler = get_cosine_with_hard_restarts_schedule_with_min_lr(
+        optimizer, 
+        num_warmup_steps=warmup_steps, 
+        num_training_steps=total_steps,
+        min_lr_ratio=min_lr/args.initial_lr  # Convert to ratio
+    )
+    
+    # Set up mixed precision training
+    scaler = GradScaler(enabled=args.mixed_precision)
+    
+    # Create learning rate schedule table for visualization
+    lr_schedule = []
+    for step in range(0, total_steps+1, max(1, total_steps//20)):  # Sample points
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.initial_lr
+        for _ in range(step):
+            scheduler.step()
+        lr_schedule.append([step, optimizer.param_groups[0]['lr']])
+    
+    # Reset optimizer
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = args.initial_lr
+    scheduler = get_cosine_with_hard_restarts_schedule_with_min_lr(
+        optimizer, 
+        num_warmup_steps=warmup_steps, 
+        num_training_steps=total_steps,
+        min_lr_ratio=min_lr/args.initial_lr
+    )
+    
+    # Initialize weights and biases if enabled
+    wandb_enabled = not args.disable_wandb
+    try:
+        if wandb_enabled:
+            wandb.init(
+                project="synthea_train",
+                name=f"run_{time.strftime('%Y%m%d_%H%M%S')}",
+                config=vars(args),
+                # Add tags for easier filtering
+                tags=["synthea", f"model-{args.model_name.split('/')[-1]}", f"workers-{args.num_workers}"]
+            )
+            # Log system info
+            wandb.config.update({
+                "system": {
+                    "python_version": sys.version,
+                    "torch_version": torch.__version__,
+                    "gpu_available": torch.cuda.is_available(),
+                    "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                    "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+                }
+            })
+            
+            # Define metrics
+            wandb.define_metric("epoch")
+            # Set epoch as the x-axis for these metrics
+            wandb.define_metric("epoch/*", step_metric="epoch")
+            # Set the validation metrics to use epoch as well
+            wandb.define_metric("validation/*", step_metric="epoch")
+            # Set global_step as the x-axis for training metrics
+            wandb.define_metric("global_step")
+            wandb.define_metric("train/*", step_metric="global_step")
+            
+            # Log the learning rate schedule to wandb
+            try:
+                lr_table = wandb.Table(data=lr_schedule, columns=["step", "learning_rate"])
+                wandb.log({
+                    "lr_schedule": wandb.plot.line(
+                        lr_table, "step", "learning_rate",
+                        title="Learning Rate Schedule"
+                    )
+                })
+            except Exception as e:
+                logger.warning(f"Failed to log LR schedule to wandb: {e}")
+                wandb_enabled = False
+    except Exception as e:
+        logger.warning(f"Failed to initialize wandb: {e}")
+        wandb_enabled = False
+        logger.info("Training will continue without wandb logging")
+    
+    # Set up checkpoint directory
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # If we're resuming from a checkpoint, load it
     start_epoch = 0
     best_val_loss = float('inf')
-    train_losses = []
-    val_losses = []
-    total_tokens_processed = 0
     
-    # Load checkpoint if specified
     if args.resume_from_checkpoint:
-        if os.path.isfile(args.resume_from_checkpoint):
-            start_epoch, best_val_loss = load_checkpoint(
-                model, optimizer, scheduler, args.resume_from_checkpoint
-            )
-            logger.info(f"Resuming training from epoch {start_epoch}")
-        else:
-            logger.warning(f"No checkpoint found at {args.resume_from_checkpoint}, starting from scratch")
-    
-    # Define test cases for periodic evaluation if inference is enabled
-    test_cases = []
-    if not args.disable_inference:
-        test_cases = [
-            {
-                "query": "active\tpharmacy\tnormal\t1\t<mask><mask><mask><mask><mask><mask><mask><mask>\t0.45\t2015-08-22\tAMB\t\tcomplete\t0.45\tfemale\t1983-05-07\t41\tBlack or African American\tHispanic or Latino\tMarried\tSpanish\tFalse",
-                "candidates": ["lisinopril 10 MG Oral Tablet"]
-            },
-            {
-                "query": "active\tpharmacy\tnormal\t1\t<mask><mask><mask><mask><mask><mask><mask><mask><mask><mask><mask><mask><mask>\t0.45\t2015-08-22\tAMB\t\tcomplete\t0.45\tfemale\t1983-05-07\t41\tBlack or African American\tHispanic or Latino\tMarried\tSpanish\tFalse",
-                "candidates": ["Hydrochlorothiazide 25 MG Oral Tablet"]
-            }
-        ]
-        logger.info("Example inference testing is enabled")
-    else:
-        logger.info("Example inference testing is disabled")
+        logger.info(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+        start_epoch, best_val_loss = load_checkpoint(model, optimizer, scheduler, args.resume_from_checkpoint)
+        logger.info(f"Resuming from epoch {start_epoch} with validation loss {best_val_loss:.4f}")
     
     # Training loop
-    logger.info("Starting training...")
-    model.train()
+    logger.info("Starting training")
     
+    # Track metrics
+    train_losses = []
+    val_losses = []
     no_improvement_count = 0
+    total_tokens_processed = 0
     
-    # Track training time
+    # For plotting learning curves
+    loss_plot_data = []
+    val_loss_plot_data = []
+    train_ppl_data = []
+    val_ppl_data = []
+    
+    # Track global step for more frequent saving
+    global_step = 0
+    
+    # Store start time for total duration calculation
     training_start_time = time.time()
     
+    # Main training loop
     for epoch in range(start_epoch, args.num_epochs):
-        total_loss = 0
+        # Reset metrics for this epoch
         epoch_tokens = 0
+        total_loss = 0
         epoch_start_time = time.time()
         
-        # Reset datasets at the beginning of each epoch
-        # (Only needed for the training dataset - validation runs on a separate segment)
-        logger.info(f"Resetting training dataset for epoch {epoch + 1}")
-        train_dataloader.dataset.reset()
+        # Set model to training mode
+        model.train()
         
-        # Set number of batch steps for this epoch using the actual dataloader length
-        total_batches = len(train_dataloader)
-        
-        logger.info(f"Processing {total_batches:,} batches in epoch {epoch+1} with batch size {args.batch_size}")
+        # Calculate number of batches for this epoch
+        total_batches = train_dataloader.num_batches
+        if args.max_steps_per_epoch > 0:
+            total_batches = min(total_batches, args.max_steps_per_epoch)
         
         # Create a tqdm progress bar with enhanced visibility settings
         progress_bar = tqdm(
@@ -922,6 +869,40 @@ def main(args):
                 'line': f"{train_dataloader.dataset.current_line:,}"
             })
             
+            # Increment global step counter
+            global_step += 1
+            
+            # Save checkpoint every 1000 steps
+            if global_step % 1000 == 0:
+                logger.info(f"Saving checkpoint at step {global_step}")
+                save_checkpoint(model, optimizer, scheduler, epoch, args, best_val_loss, step=global_step)
+                
+                # Also run a validation to help with early problem detection
+                logger.info(f"Running validation at step {global_step}")
+                try:
+                    step_val_loss, _ = validate(model, val_dataloader, device)
+                    logger.info(f"Validation loss at step {global_step}: {step_val_loss:.4f}")
+                    
+                    # Log to wandb if enabled
+                    if wandb_enabled:
+                        try:
+                            wandb.log({
+                                'step_validation/loss': step_val_loss,
+                                'step_validation/perplexity': np.exp(step_val_loss),
+                                'global_step': global_step
+                            })
+                        except Exception as e:
+                            logger.warning(f"Failed to log to wandb: {e}")
+                            wandb_enabled = False
+                        
+                        # Check if this is the best model so far
+                        if step_val_loss < best_val_loss:
+                            logger.info(f"Validation loss improved from {best_val_loss:.4f} to {step_val_loss:.4f}")
+                            best_val_loss = step_val_loss
+                            save_checkpoint(model, optimizer, scheduler, epoch, args, best_val_loss, best=True)
+                except Exception as e:
+                    logger.warning(f"Error during step validation: {e}")
+            
             # Print stats every 100 steps for visibility in log files, but not during interactive sessions
             if step % 100 == 0 and not IS_INTERACTIVE:
                 logger.info(
@@ -930,24 +911,32 @@ def main(args):
                 )
             
             # Log to TensorBoard
-            global_step = epoch * total_batches + step
-            writer.add_scalar('train/loss', loss.item(), global_step)
-            writer.add_scalar('train/lr', scheduler.get_last_lr()[0], global_step)
-            writer.add_scalar('train/line_position', train_dataloader.dataset.current_line, global_step)
+            if tensorboard_enabled:
+                try:
+                    writer.add_scalar('train/loss', loss.item(), global_step)
+                    writer.add_scalar('train/lr', scheduler.get_last_lr()[0], global_step)
+                    writer.add_scalar('train/line_position', train_dataloader.dataset.current_line, global_step)
+                except Exception as e:
+                    logger.warning(f"Error logging to TensorBoard: {e}")
+                    tensorboard_enabled = False
             
             # Log to W&B with more comprehensive metrics
-            if not args.disable_wandb:
-                wandb.log({
-                    'train/loss': loss.item(),
-                    'train/lr': scheduler.get_last_lr()[0],
-                    'train/batch_tokens': batch_tokens,
-                    'train/tokens_per_sec': tokens_per_sec,
-                    'train/line_position': train_dataloader.dataset.current_line,
-                    'train/epoch': epoch + (step / total_batches),  # Fractional epoch
-                    'train/avg_loss': avg_loss,
-                    'train/perplexity': np.exp(loss.item()),
-                    'global_step': global_step
-                })
+            if wandb_enabled:
+                try:
+                    wandb.log({
+                        'train/loss': loss.item(),
+                        'train/lr': scheduler.get_last_lr()[0],
+                        'train/batch_tokens': batch_tokens,
+                        'train/tokens_per_sec': tokens_per_sec,
+                        'train/line_position': train_dataloader.dataset.current_line,
+                        'train/epoch': epoch + (step / total_batches),  # Fractional epoch
+                        'train/avg_loss': avg_loss,
+                        'train/perplexity': np.exp(loss.item()),
+                        'global_step': global_step
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to log to wandb: {e}")
+                    wandb_enabled = False
             
             # For very large datasets, we might want to break after a certain number of steps
             # to avoid extremely long epochs
@@ -970,71 +959,92 @@ def main(args):
         tokens_per_second = epoch_tokens / epoch_time
         
         # Validate after each epoch
-        val_loss, val_tokens = validate(model, val_dataloader, device)
-        val_losses.append(val_loss)
-        
-        # Print epoch statistics with clear formatting
-        logger.info(f"Epoch {epoch+1}/{args.num_epochs}")
-        logger.info(f"  Train Loss: {avg_train_loss:.4f}")
-        logger.info(f"  Validation Loss: {val_loss:.4f}")
-        logger.info(f"  Perplexity: {np.exp(val_loss):.2f}")
-        logger.info(f"  Tokens processed this epoch: {epoch_tokens:,}")
-        logger.info(f"  Total tokens processed: {total_tokens_processed:,}")
-        logger.info(f"  Epoch time: {epoch_time:.2f}s")
-        logger.info(f"  Processing speed: {tokens_per_second:.2f} tokens/second")
-        
-        # Log to TensorBoard
-        writer.add_scalar('epoch/train_loss', avg_train_loss, epoch)
-        writer.add_scalar('epoch/val_loss', val_loss, epoch)
-        writer.add_scalar('epoch/perplexity', np.exp(val_loss), epoch)
-        writer.add_scalar('epoch/tokens_processed', epoch_tokens, epoch)
-        writer.add_scalar('epoch/total_tokens_processed', total_tokens_processed, epoch)
-        writer.add_scalar('epoch/tokens_per_second', tokens_per_second, epoch)
-        
-        # Log to W&B with more comprehensive epoch metrics
-        if not args.disable_wandb:
-            wandb.log({
-                'epoch': epoch + 1,
-                'epoch/train_loss': avg_train_loss,
-                'epoch/val_loss': val_loss,
-                'epoch/train_perplexity': np.exp(avg_train_loss),
-                'epoch/val_perplexity': np.exp(val_loss),
-                'epoch/tokens_processed': epoch_tokens,
-                'epoch/total_tokens_processed': total_tokens_processed,
-                'epoch/tokens_per_second': tokens_per_second,
-                'epoch/epoch_time': epoch_time,
-                'epoch/learning_rate': scheduler.get_last_lr()[0],
-                'epoch/no_improvement_count': no_improvement_count
-            })
+        try:
+            val_loss, val_tokens = validate(model, val_dataloader, device)
+            val_losses.append(val_loss)
             
-            # Log validation metrics separately to create a custom chart
-            wandb.log({
-                'validation/loss': val_loss,
-                'validation/perplexity': np.exp(val_loss),
-                'validation/tokens': val_tokens
-            })
-        
-        # Save checkpoint
-        save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss)
-        
-        # Check if this is the best model so far
-        if val_loss < best_val_loss:
-            logger.info(f"Validation loss improved from {best_val_loss:.4f} to {val_loss:.4f}")
-            best_val_loss = val_loss
-            save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=True)
-            no_improvement_count = 0
-        else:
-            no_improvement_count += 1
-            logger.info(f"No improvement for {no_improvement_count} epochs")
-        
-        # Run example inference every few epochs if enabled
-        if not args.disable_inference and (epoch + 1) % args.inference_interval == 0:
-            run_example_inference(model, tokenizer, test_cases, device)
-        
-        # Early stopping
-        if args.early_stopping > 0 and no_improvement_count >= args.early_stopping:
-            logger.info(f"Early stopping triggered after {no_improvement_count} epochs without improvement")
-            break
+            # Print epoch statistics with clear formatting
+            logger.info(f"Epoch {epoch+1}/{args.num_epochs}")
+            logger.info(f"  Train Loss: {avg_train_loss:.4f}")
+            logger.info(f"  Validation Loss: {val_loss:.4f}")
+            logger.info(f"  Perplexity: {np.exp(val_loss):.2f}")
+            logger.info(f"  Tokens processed this epoch: {epoch_tokens:,}")
+            logger.info(f"  Total tokens processed: {total_tokens_processed:,}")
+            logger.info(f"  Epoch time: {epoch_time:.2f}s")
+            logger.info(f"  Processing speed: {tokens_per_second:.2f} tokens/second")
+            
+            # Add data for plots
+            loss_plot_data.append([epoch + 1, avg_train_loss])
+            val_loss_plot_data.append([epoch + 1, val_loss])
+            train_ppl_data.append([epoch + 1, np.exp(avg_train_loss)])
+            val_ppl_data.append([epoch + 1, np.exp(val_loss)])
+            
+            # Log to TensorBoard
+            if tensorboard_enabled:
+                try:
+                    writer.add_scalar('epoch/train_loss', avg_train_loss, epoch)
+                    writer.add_scalar('epoch/val_loss', val_loss, epoch)
+                    writer.add_scalar('epoch/perplexity', np.exp(val_loss), epoch)
+                    writer.add_scalar('epoch/tokens_processed', epoch_tokens, epoch)
+                    writer.add_scalar('epoch/total_tokens_processed', total_tokens_processed, epoch)
+                    writer.add_scalar('epoch/tokens_per_second', tokens_per_second, epoch)
+                except Exception as e:
+                    logger.warning(f"Error logging to TensorBoard: {e}")
+                    tensorboard_enabled = False
+            
+            # Log to W&B with more comprehensive epoch metrics
+            if wandb_enabled:
+                try:
+                    wandb.log({
+                        'epoch': epoch + 1,
+                        'epoch/train_loss': avg_train_loss,
+                        'epoch/val_loss': val_loss,
+                        'epoch/train_perplexity': np.exp(avg_train_loss),
+                        'epoch/val_perplexity': np.exp(val_loss),
+                        'epoch/tokens_processed': epoch_tokens,
+                        'epoch/total_tokens_processed': total_tokens_processed,
+                        'epoch/tokens_per_second': tokens_per_second,
+                        'epoch/epoch_time': epoch_time,
+                        'epoch/learning_rate': scheduler.get_last_lr()[0],
+                        'epoch/no_improvement_count': no_improvement_count
+                    })
+                    
+                    # Log validation metrics separately to create a custom chart
+                    wandb.log({
+                        'validation/loss': val_loss,
+                        'validation/perplexity': np.exp(val_loss),
+                        'validation/tokens': val_tokens
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to log to wandb: {e}")
+                    wandb_enabled = False
+            
+            # Save checkpoint
+            save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss)
+            
+            # Check if this is the best model so far
+            if val_loss < best_val_loss:
+                logger.info(f"Validation loss improved from {best_val_loss:.4f} to {val_loss:.4f}")
+                best_val_loss = val_loss
+                save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=True)
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+                logger.info(f"No improvement for {no_improvement_count} epochs")
+            
+            # Run example inference every few epochs if enabled
+            if not args.disable_inference and (epoch + 1) % args.inference_interval == 0:
+                run_example_inference(model, tokenizer, test_cases, device)
+            
+            # Early stopping
+            if args.early_stopping > 0 and no_improvement_count >= args.early_stopping:
+                logger.info(f"Early stopping triggered after {no_improvement_count} epochs without improvement")
+                break
+                
+        except Exception as e:
+            logger.error(f"Error during validation: {e}")
+            # Continue training despite validation error
+            logger.info("Continuing to next epoch despite validation error")
     
     # Calculate total training time
     total_training_time = time.time() - training_start_time
@@ -1048,97 +1058,67 @@ def main(args):
     # Create final training summary with all key metrics
     final_metrics = {
         'training/total_time': total_training_time,
-        'training/total_tokens': total_tokens_processed,
-        'training/avg_tokens_per_second': total_tokens_processed / total_training_time,
-        'training/epochs_completed': epoch + 1,
+        'training/total_epochs': len(train_losses),
         'training/best_val_loss': best_val_loss,
         'training/best_val_perplexity': np.exp(best_val_loss),
-        'training/final_train_loss': train_losses[-1] if train_losses else float('nan'),
-        'training/final_val_loss': val_losses[-1] if val_losses else float('nan'),
+        'training/total_tokens': total_tokens_processed,
+        'training/tokens_per_second': total_tokens_processed / total_training_time
     }
     
-    # Log final stats to W&B with more details
-    if not args.disable_wandb:
-        # Create a custom wandb summary panel
-        wandb.run.summary.update(final_metrics)
-        
-        # Create and log loss curve plot
-        if train_losses and val_losses:
-            epochs = list(range(1, len(train_losses) + 1))
-            loss_plot_data = [[x, y] for (x, y) in zip(epochs, train_losses)]
-            val_loss_plot_data = [[x, y] for (x, y) in zip(epochs, val_losses)]
+    # Log final summary to W&B
+    if wandb_enabled:
+        try:
+            # Create a custom wandb summary panel
+            wandb.run.summary.update(final_metrics)
             
-            loss_table = wandb.Table(data=loss_plot_data, columns=["epoch", "train_loss"])
-            val_loss_table = wandb.Table(data=val_loss_plot_data, columns=["epoch", "val_loss"])
+            # Create the final training plots
+            # Loss plot
+            try:
+                loss_table = wandb.Table(data=loss_plot_data, columns=["epoch", "train_loss"])
+                val_loss_table = wandb.Table(data=val_loss_plot_data, columns=["epoch", "val_loss"])
+                
+                wandb.log({
+                    "training_curves/loss_plot": wandb.plot.line(
+                        loss_table, "epoch", "train_loss", title="Training Loss by Epoch"),
+                    "training_curves/val_loss_plot": wandb.plot.line(
+                        val_loss_table, "epoch", "val_loss", title="Validation Loss by Epoch")
+                })
+                
+                # Perplexity plot
+                train_ppl_table = wandb.Table(data=train_ppl_data, columns=["epoch", "train_perplexity"])
+                val_ppl_table = wandb.Table(data=val_ppl_data, columns=["epoch", "val_perplexity"])
+                
+                wandb.log({
+                    "training_curves/train_perplexity_plot": wandb.plot.line(
+                        train_ppl_table, "epoch", "train_perplexity", title="Training Perplexity by Epoch"),
+                    "training_curves/val_perplexity_plot": wandb.plot.line(
+                        val_ppl_table, "epoch", "val_perplexity", title="Validation Perplexity by Epoch")
+                })
+            except Exception as e:
+                logger.warning(f"Failed to create wandb plots: {e}")
             
-            wandb.log({
-                "training_curves/loss_plot": wandb.plot.line(
-                    loss_table, "epoch", "train_loss", title="Training Loss Curve"),
-                "training_curves/val_loss_plot": wandb.plot.line(
-                    val_loss_table, "epoch", "val_loss", title="Validation Loss Curve")
-            })
-            
-            # Also log perplexity curves
-            train_ppl = [np.exp(loss) for loss in train_losses]
-            val_ppl = [np.exp(loss) for loss in val_losses]
-            
-            train_ppl_data = [[x, y] for (x, y) in zip(epochs, train_ppl)]
-            val_ppl_data = [[x, y] for (x, y) in zip(epochs, val_ppl)]
-            
-            train_ppl_table = wandb.Table(data=train_ppl_data, columns=["epoch", "train_perplexity"])
-            val_ppl_table = wandb.Table(data=val_ppl_data, columns=["epoch", "val_perplexity"])
-            
-            wandb.log({
-                "training_curves/train_perplexity_plot": wandb.plot.line(
-                    train_ppl_table, "epoch", "train_perplexity", title="Training Perplexity Curve"),
-                "training_curves/val_perplexity_plot": wandb.plot.line(
-                    val_ppl_table, "epoch", "val_perplexity", title="Validation Perplexity Curve")
-            })
-        
-        # Finish the wandb run
-        wandb.finish()
+            # Finish the wandb run
+            try:
+                wandb.finish()
+            except Exception as e:
+                logger.warning(f"Failed to properly finish wandb run: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to log final summary to wandb: {e}")
     
-    # Plot training progress
-    plot_training_progress(train_losses, val_losses, args.output_dir)
+    # Save a plot of the learning curves
+    try:
+        plot_training_progress(train_losses, val_losses, args.output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to create training progress plot: {e}")
     
-    # Final evaluation on test cases if enabled
-    if not args.disable_inference:
-        run_example_inference(model, tokenizer, test_cases, device)
+    # Close TensorBoard writer if it exists
+    if tensorboard_enabled and writer is not None:
+        try:
+            writer.close()
+        except Exception as e:
+            logger.warning(f"Error closing TensorBoard writer: {e}")
     
-    # Save final model
-    final_model_path = os.path.join(args.output_dir, "final_model")
-    
-    # For compiled models, we need to save the original model state
-    if hasattr(model, '_orig_mod'):
-        model._orig_mod.save_pretrained(final_model_path)
-    else:
-        model.save_pretrained(final_model_path)
-    
-    tokenizer.save_pretrained(final_model_path)
-    logger.info(f"Final model saved to {final_model_path}")
-    
-    # Final cleanup to prevent temp directory issues
-    train_dataset = train_dataloader.dataset
-    val_dataset = val_dataloader.dataset
-    
-    # Explicitly close datasets before exiting
-    if hasattr(train_dataset, 'close'):
-        train_dataset.close()
-    
-    if hasattr(val_dataset, 'close'):
-        val_dataset.close()
-    
-    # Force garbage collection
-    del train_dataloader
-    del val_dataloader
-    gc.collect()
-    
-    # Cleanup temp directories as a safety measure
-    from dataset import cleanup_temp_dirs
-    cleanup_temp_dirs()
-    
-    # Close TensorBoard writer
-    writer.close()
+    return model, tokenizer, best_val_loss
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a RoBERTa model for masked language modeling on claims data")

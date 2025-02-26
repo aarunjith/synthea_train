@@ -516,92 +516,84 @@ class StreamingClaimsMaskedDataset(Dataset):
 
 class SequentialStreamingClaimsMaskedDataset(Dataset):
     """
-    Memory-efficient dataset that processes data sequentially, one line at a time.
-    This implementation is optimized for pure sequential access without random access overhead.
-    It tracks the current position and processes data in batches.
+    A dataset that reads TSV data sequentially to avoid memory overhead.
+    Handles file opening, closing, and wrapping around to the beginning for multiple epochs.
     """
     def __init__(self, file_path, tokenizer, max_length=128, batch_size=16):
+        # Store parameters
         self.file_path = file_path
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.batch_size = batch_size
         
-        # Count lines for epoch tracking (without verbose logging)
-        self.line_count = self._count_lines()
-        
-        # Set up file objects for reading - use a safer approach with tracking
-        self.file = open(file_path, 'r')
-        # Register file handle for cleanup
-        _OPEN_FILES.add(self.file)
-        
-        self.current_line = 0
-        self.current_epoch = 0
-        
-        # Sample a few lines to estimate examples per line for size estimation
-        self.estimated_examples_per_line = self._estimate_examples_per_line()
-        self.total_examples = int(self.line_count * self.estimated_examples_per_line)
-        
-        # Batch processing state
-        self.current_batch = []
-        self.batch_position = 0
-    
-    def __del__(self):
-        """Ensure file resources are closed when this object is garbage collected."""
-        self.close()
-    
-    def close(self):
-        """Explicitly close all file resources."""
+        # Open the data file
         try:
-            if hasattr(self, 'file') and self.file and not self.file.closed:
-                self.file.close()
+            self.file = open(self.file_path, 'r')
+            # Register file for cleanup
+            _OPEN_FILES.add(self.file)
         except Exception as e:
-            logger.debug(f"Error closing file in dataset: {e}")
-    
-    def _count_lines(self):
-        """Count lines in the file efficiently."""
-        # For very large files, use a faster method
-        file_size = os.path.getsize(self.file_path)
-        if file_size > 100 * 1024 * 1024:  # If > 100MB
-            # Sample the file to get average line length, then estimate
-            sample_size = 1000
-            with open(self.file_path, 'r') as f:
-                sample_lines = [next(f) for _ in range(sample_size) if _ < sample_size]
-            
-            avg_line_length = sum(len(line) for line in sample_lines) / len(sample_lines)
-            estimated_lines = int(file_size / avg_line_length)
-            return estimated_lines
-        else:
-            # For smaller files, count directly
-            with open(self.file_path, 'r') as f:
-                count = sum(1 for _ in f)
-            return count
-    
-    def _estimate_examples_per_line(self):
-        """Estimate how many examples (masked items) we get per line on average."""
+            raise RuntimeError(f"Failed to open dataset file {file_path}: {e}")
+        
+        # Initialize counters
+        self.line_count = self._count_lines()
+        self.total_examples = self._estimate_examples_per_line() * self.line_count
+        
         # Reset file position
         self.file.seek(0)
         
-        # Sample a few lines to get an estimate
-        sample_size = min(100, self.line_count)
+        # Track current state
+        self.current_line = 0
+        self.current_epoch = 0
+        self.current_batch = None
+        self.batch_position = 0
+        
+    def __del__(self):
+        """Clean up resources when the dataset is deleted."""
+        self.close()
+    
+    def close(self):
+        """Close the data file if it's open."""
+        if hasattr(self, 'file') and self.file and not self.file.closed:
+            try:
+                self.file.close()
+                if self.file in _OPEN_FILES:
+                    _OPEN_FILES.remove(self.file)
+            except:
+                pass  # Ignore errors during cleanup
+            
+    def _count_lines(self):
+        """Count the number of lines in the file."""
+        # This is a fast way to count lines without loading the whole file
+        with open(self.file_path, 'r') as f:
+            lines = sum(1 for _ in f)
+        return max(1, lines)  # Ensure at least 1 line
+    
+    def _estimate_examples_per_line(self):
+        """Estimate the average number of examples generated per line."""
+        # This helps us provide a reasonable __len__ estimate
+        sample_size = min(1000, self.line_count)
         total_examples = 0
+        
+        # Sample the first N lines
+        current_pos = self.file.tell()
+        self.file.seek(0)
         
         for _ in range(sample_size):
             line = self.file.readline().strip()
             if not line:
-                continue
+                break
             
-            # Count non-empty columns (potential mask targets)
-            line = line.replace('\t', '<tab>')
+            # Count columns in the line which will become mask examples
             columns = line.split('<tab>')
-            num_examples = sum(1 for col in columns if col.strip())
-            
-            total_examples += num_examples
+            non_empty_columns = sum(1 for col in columns if col.strip())
+            total_examples += non_empty_columns
         
         # Reset file position
-        self.file.seek(0)
+        self.file.seek(current_pos)
         
         # Calculate average examples per line
         avg_examples = total_examples / sample_size if sample_size > 0 else 0
+        self.total_examples = int(avg_examples * self.line_count)  # Convert to integer
         return avg_examples
     
     def _get_next_batch(self, batch_size):
@@ -610,20 +602,49 @@ class SequentialStreamingClaimsMaskedDataset(Dataset):
         examples = []
         lines_processed = 0
         
-        while len(examples) < batch_size and lines_processed < self.line_count:
-            # Read the next line
-            line = self.file.readline().strip()
-            if not line:
-                # If we reach EOF, wrap around to the beginning for the next epoch
-                # Close and reopen file handle to prevent resource leaks
-                self.file.close()
+        # Ensure file is open for reading
+        if self.file is None or self.file.closed:
+            try:
                 self.file = open(self.file_path, 'r')
                 # Register the new file handle
                 _OPEN_FILES.add(self.file)
-                
-                self.current_epoch += 1
-                # No more logger.info for epoch starts - tqdm will handle this
+            except Exception as e:
+                raise RuntimeError(f"Failed to open dataset file {self.file_path}: {e}")
+        
+        while len(examples) < batch_size and lines_processed < self.line_count:
+            try:
+                # Read the next line
                 line = self.file.readline().strip()
+                if not line:
+                    # If we reach EOF, wrap around to the beginning for the next epoch
+                    # Close and reopen file handle to prevent resource leaks
+                    if not self.file.closed:
+                        self.file.close()
+                        if self.file in _OPEN_FILES:
+                            _OPEN_FILES.remove(self.file)
+                    
+                    self.file = open(self.file_path, 'r')
+                    # Register the new file handle
+                    _OPEN_FILES.add(self.file)
+                    
+                    self.current_epoch += 1
+                    # No more logger.info for epoch starts - tqdm will handle this
+                    line = self.file.readline().strip()
+            except Exception as e:
+                # If there's an error with the file, try to reopen it
+                logger.warning(f"Error reading from file: {e}. Attempting to reopen.")
+                try:
+                    if hasattr(self, 'file') and self.file and not self.file.closed:
+                        self.file.close()
+                        if self.file in _OPEN_FILES:
+                            _OPEN_FILES.remove(self.file)
+                    
+                    self.file = open(self.file_path, 'r')
+                    # Register the new file handle
+                    _OPEN_FILES.add(self.file)
+                    continue  # Try reading again
+                except Exception as e2:
+                    raise RuntimeError(f"Failed to recover file handle for {self.file_path}: {e2}")
             
             # Process the line
             self.current_line += 1
@@ -678,6 +699,21 @@ class SequentialStreamingClaimsMaskedDataset(Dataset):
         # Remove the periodic logging - tqdm will handle progress display
         return examples
     
+    def reset(self):
+        """Reset the dataset to the beginning of the file."""
+        self.close()
+        try:
+            self.file = open(self.file_path, 'r')
+            # Register the new file handle
+            _OPEN_FILES.add(self.file)
+            
+            self.current_line = 0
+            self.current_epoch = 0
+            self.current_batch = None
+            self.batch_position = 0
+        except Exception as e:
+            raise RuntimeError(f"Failed to reset dataset by reopening {self.file_path}: {e}")
+            
     def _mask_row(self, text):
         """
         Mask each column value separately.
@@ -714,7 +750,7 @@ class SequentialStreamingClaimsMaskedDataset(Dataset):
     
     def __len__(self):
         """Return an estimate of the total number of examples."""
-        return self.total_examples
+        return int(self.total_examples)  # Ensure we return an integer
     
     def __getitem__(self, idx):
         """Get next item from the dataset - sequential access ignoring the index."""
@@ -732,19 +768,3 @@ class SequentialStreamingClaimsMaskedDataset(Dataset):
         self.batch_position += 1
         
         return item
-    
-    def reset(self):
-        """Reset the dataset to the beginning of the file."""
-        # Close existing file handle first if it exists
-        if hasattr(self, 'file') and self.file and not self.file.closed:
-            self.file.close()
-        
-        # Open a fresh file handle
-        self.file = open(self.file_path, 'r')
-        # Register file handle for cleanup
-        _OPEN_FILES.add(self.file)
-        
-        self.current_line = 0
-        self.current_epoch = 0
-        self.current_batch = []
-        self.batch_position = 0
