@@ -1,0 +1,8 @@
+*.log
+*.pyc
+__pycache__/*
+.env
+.venv
+wandb/*
+runs/*
+fhir/*
