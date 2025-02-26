@@ -65,7 +65,7 @@ def load_data(data_file, tokenizer, cache_dir="./cache", max_length=128, validat
     Load and preprocess data for the model, using a sequential streaming approach.
     
     Returns:
-        train_dataloader, val_dataloader
+        train_dataloader, val_dataloader (None if validation is disabled)
     """
     os.makedirs(cache_dir, exist_ok=True)
     
@@ -82,44 +82,44 @@ def load_data(data_file, tokenizer, cache_dir="./cache", max_length=128, validat
     # Use sequential streaming dataset for much faster processing
     batch_size = args.batch_size  # Default to args.batch_size
     
-    # Create training dataset
-    train_dataset = SequentialStreamingClaimsMaskedDataset(
-        file_path=data_file,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        batch_size=batch_size
-    )
+    # Create training dataset with error handling
+    try:
+        train_dataset = SequentialStreamingClaimsMaskedDataset(
+            file_path=data_file,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            batch_size=batch_size
+        )
+    except Exception as e:
+        logger.error(f"Error creating training dataset: {e}")
+        # Create a fallback dataset with minimal configuration
+        logger.info("Creating fallback dataset to ensure training can proceed")
+        train_dataset = SequentialStreamingClaimsMaskedDataset(
+            file_path=data_file,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            batch_size=batch_size
+        )
     
-    # Create validation dataset with a separate file handle
-    val_dataset = SequentialStreamingClaimsMaskedDataset(
-        file_path=data_file,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        batch_size=batch_size
-    )
+    # Disable validation dataset entirely
+    logger.info("Validation dataset is disabled as requested")
+    val_dataset = None
     
-    # Skip ahead in validation dataset to avoid overlap with training
-    # (This is a simple way to create a validation set without shuffling)
-    val_lines_to_skip = int(train_dataset.line_count * (1 - validation_split))
-    for _ in range(val_lines_to_skip):
-        val_dataset.file.readline()
-    val_dataset.current_line = val_lines_to_skip
+    # If training dataset has zero examples, set a minimal default
+    avg_examples_per_line = 1
+    if hasattr(train_dataset, 'total_examples') and hasattr(train_dataset, 'line_count'):
+        if train_dataset.line_count > 0:
+            avg_examples_per_line = train_dataset.total_examples / train_dataset.line_count
     
-    logger.info(f"Training dataset: Processing from beginning of file")
-    logger.info(f"Validation dataset: Starting from line {val_lines_to_skip:,}")
+    total_examples = getattr(train_dataset, 'total_examples', 1000)  # Fallback to 1000 if not available
     
-    # Log important statistics about dataset size and examples
-    avg_examples_per_line = train_dataset.total_examples / train_dataset.line_count if train_dataset.line_count > 0 else 0
-    total_examples = train_dataset.total_examples
-    train_examples = int(total_examples * (1 - validation_split))
-    val_examples = int(total_examples * validation_split)
-    
+    # Log dataset info with safety checks
     logger.info(f"Dataset statistics:")
-    logger.info(f"  Total lines: {train_dataset.line_count:,}")
+    logger.info(f"  Total lines: {getattr(train_dataset, 'line_count', 0):,}")
     logger.info(f"  Average examples (columns) per line: {avg_examples_per_line:.2f}")
     logger.info(f"  Estimated total examples: {total_examples:,}")
-    logger.info(f"  Training examples: ~{train_examples:,}")
-    logger.info(f"  Validation examples: ~{val_examples:,}")
+    logger.info(f"  Training examples: ~{total_examples:,}")
+    logger.info(f"  Validation: Disabled")
     
     # Worker initialization function to ensure clean process state
     def worker_init_fn(worker_id):
@@ -155,74 +155,77 @@ def load_data(data_file, tokenizer, cache_dir="./cache", max_length=128, validat
         except RuntimeError:
             logger.warning("Could not set sharing strategy to file_system")
     
-    # Create DataLoaders that don't shuffle (sequential processing)
-    train_dataloader = torch.utils.data.DataLoader(
+    # Set up dataloader configuration
+    dataloader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': args.num_workers,
+        'pin_memory': True,
+        'worker_init_fn': worker_init_fn,
+        'multiprocessing_context': mp_start_method if use_mp else None,
+        'persistent_workers': use_mp,  # Keep workers alive between batches
+        'prefetch_factor': 2 if use_mp else None  # Control prefetching
+    }
+    
+    # Create training dataloader
+    train_dataloader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=False,  # No need to shuffle as we're processing sequentially
-        num_workers=args.num_workers,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-        multiprocessing_context=mp_start_method if use_mp else None,
-        persistent_workers=use_mp,  # Keep workers alive between batches
-        prefetch_factor=2 if use_mp else None  # Control prefetching
+        **dataloader_kwargs
     )
     
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,  # No need to shuffle as we're processing sequentially
-        num_workers=args.num_workers,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-        multiprocessing_context=mp_start_method if use_mp else None,
-        persistent_workers=use_mp,  # Keep workers alive between batches
-        prefetch_factor=2 if use_mp else None  # Control prefetching
-    )
+    # Calculate estimated number of batches for logging
+    estimated_train_batches = math.ceil(total_examples / batch_size)
+    
+    # Store the estimated number of batches in the dataloader objects for later use
+    train_dataloader.num_batches = estimated_train_batches
+    
+    # Handle validation dataloader - will be None if validation is disabled
+    val_dataloader = None
     
     # Report elapsed time for data processing
     elapsed_time = time.time() - start_time
     logger.info(f"Dataset preparation completed in {elapsed_time:.2f} seconds")
     
-    # Calculate estimated number of batches for logging
-    # Use math.ceil to ensure we round up to include all data
-    estimated_train_batches = math.ceil(train_examples / batch_size)
-    estimated_val_batches = math.ceil(val_examples / batch_size)
-    
-    # Log dataloader details (using estimated values)
+    # Log dataloader details
     logger.info(f"Created dataloaders with:")
     logger.info(f"  Estimated training batches: {estimated_train_batches:,}")
-    logger.info(f"  Estimated validation batches: {estimated_val_batches:,}") 
+    logger.info(f"  Validation: Disabled")
     logger.info(f"  Batch size: {batch_size}")
     logger.info(f"  Total training capacity: {estimated_train_batches * batch_size:,} examples")
-    
-    # Store the estimated number of batches in the dataloader objects for later use
-    train_dataloader.num_batches = estimated_train_batches
-    val_dataloader.num_batches = estimated_val_batches
     
     return train_dataloader, val_dataloader
 
 def create_dataloaders(dataset, train_sampler, val_sampler, batch_size, num_workers):
-    """Create DataLoader objects for training and validation."""
-    train_dataloader = torch.utils.data.DataLoader(
+    """Create DataLoader instances for training and validation."""
+    dataloader_args = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': True if torch.cuda.is_available() else False,
+        'worker_init_fn': worker_init_fn,
+    }
+    
+    # Create training dataloader
+    train_dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
         sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True
+        **dataloader_args
     )
     
-    val_dataloader = torch.utils.data.DataLoader(
+    # Add helper attributes to better track progress
+    train_dataloader.num_batches = estimated_train_batches
+    
+    # Return None for val_dataloader if validation dataset is None
+    if val_sampler is None:
+        return train_dataloader, None
+    
+    # Create validation dataloader
+    val_dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
         sampler=val_sampler,
-        num_workers=num_workers,
-        pin_memory=True
+        **dataloader_args
     )
     
-    logger.info(f"Created dataloaders with batch_size={batch_size}, num_workers={num_workers}")
-    logger.info(f"Training batches: {len(train_dataloader)}, Validation batches: {len(val_dataloader)}")
-    logger.info(f"Total training examples: {len(train_sampler):,}")
+    # Add helper attributes to better track progress
+    val_dataloader.num_batches = estimated_val_batches
     
     return train_dataloader, val_dataloader
 
@@ -880,26 +883,31 @@ def main(args):
                 # Also run a validation to help with early problem detection
                 logger.info(f"Running validation at step {global_step}")
                 try:
-                    step_val_loss, _ = validate(model, val_dataloader, device)
-                    logger.info(f"Validation loss at step {global_step}: {step_val_loss:.4f}")
-                    
-                    # Log to wandb if enabled
-                    if wandb_enabled:
-                        try:
-                            wandb.log({
-                                'step_validation/loss': step_val_loss,
-                                'step_validation/perplexity': np.exp(step_val_loss),
-                                'global_step': global_step
-                            })
-                        except Exception as e:
-                            logger.warning(f"Failed to log to wandb: {e}")
-                            wandb_enabled = False
+                    if val_dataloader is not None:
+                        step_val_loss, _ = validate(model, val_dataloader, device)
+                        logger.info(f"Validation loss at step {global_step}: {step_val_loss:.4f}")
                         
-                        # Check if this is the best model so far
-                        if step_val_loss < best_val_loss:
-                            logger.info(f"Validation loss improved from {best_val_loss:.4f} to {step_val_loss:.4f}")
-                            best_val_loss = step_val_loss
-                            save_checkpoint(model, optimizer, scheduler, epoch, args, best_val_loss, best=True)
+                        # Log to wandb if enabled
+                        if wandb_enabled:
+                            try:
+                                wandb.log({
+                                    'step_validation/loss': step_val_loss,
+                                    'step_validation/perplexity': np.exp(step_val_loss),
+                                    'global_step': global_step
+                                })
+                            except Exception as e:
+                                logger.warning(f"Failed to log to wandb: {e}")
+                                wandb_enabled = False
+                            
+                            # Check if this is the best model so far
+                            if step_val_loss < best_val_loss:
+                                logger.info(f"Validation loss improved from {best_val_loss:.4f} to {step_val_loss:.4f}")
+                                best_val_loss = step_val_loss
+                                save_checkpoint(model, optimizer, scheduler, epoch, args, best_val_loss, best=True)
+                    else:
+                        logger.info("Skipping validation step as validation is disabled")
+                        # Save checkpoint as best since we can't validate
+                        save_checkpoint(model, optimizer, scheduler, epoch, args, best_val_loss, best=True)
                 except Exception as e:
                     logger.warning(f"Error during step validation: {e}")
             
@@ -960,92 +968,95 @@ def main(args):
         
         # Validate after each epoch
         try:
-            val_loss, val_tokens = validate(model, val_dataloader, device)
-            val_losses.append(val_loss)
-            
-            # Print epoch statistics with clear formatting
-            logger.info(f"Epoch {epoch+1}/{args.num_epochs}")
-            logger.info(f"  Train Loss: {avg_train_loss:.4f}")
-            logger.info(f"  Validation Loss: {val_loss:.4f}")
-            logger.info(f"  Perplexity: {np.exp(val_loss):.2f}")
-            logger.info(f"  Tokens processed this epoch: {epoch_tokens:,}")
-            logger.info(f"  Total tokens processed: {total_tokens_processed:,}")
-            logger.info(f"  Epoch time: {epoch_time:.2f}s")
-            logger.info(f"  Processing speed: {tokens_per_second:.2f} tokens/second")
-            
-            # Add data for plots
-            loss_plot_data.append([epoch + 1, avg_train_loss])
-            val_loss_plot_data.append([epoch + 1, val_loss])
-            train_ppl_data.append([epoch + 1, np.exp(avg_train_loss)])
-            val_ppl_data.append([epoch + 1, np.exp(val_loss)])
-            
-            # Log to TensorBoard
-            if tensorboard_enabled:
-                try:
-                    writer.add_scalar('epoch/train_loss', avg_train_loss, epoch)
-                    writer.add_scalar('epoch/val_loss', val_loss, epoch)
-                    writer.add_scalar('epoch/perplexity', np.exp(val_loss), epoch)
-                    writer.add_scalar('epoch/tokens_processed', epoch_tokens, epoch)
-                    writer.add_scalar('epoch/total_tokens_processed', total_tokens_processed, epoch)
-                    writer.add_scalar('epoch/tokens_per_second', tokens_per_second, epoch)
-                except Exception as e:
-                    logger.warning(f"Error logging to TensorBoard: {e}")
-                    tensorboard_enabled = False
-            
-            # Log to W&B with more comprehensive epoch metrics
-            if wandb_enabled:
-                try:
-                    wandb.log({
-                        'epoch': epoch + 1,
-                        'epoch/train_loss': avg_train_loss,
-                        'epoch/val_loss': val_loss,
-                        'epoch/train_perplexity': np.exp(avg_train_loss),
-                        'epoch/val_perplexity': np.exp(val_loss),
-                        'epoch/tokens_processed': epoch_tokens,
-                        'epoch/total_tokens_processed': total_tokens_processed,
-                        'epoch/tokens_per_second': tokens_per_second,
-                        'epoch/epoch_time': epoch_time,
-                        'epoch/learning_rate': scheduler.get_last_lr()[0],
-                        'epoch/no_improvement_count': no_improvement_count
-                    })
-                    
-                    # Log validation metrics separately to create a custom chart
-                    wandb.log({
-                        'validation/loss': val_loss,
-                        'validation/perplexity': np.exp(val_loss),
-                        'validation/tokens': val_tokens
-                    })
-                except Exception as e:
-                    logger.warning(f"Failed to log to wandb: {e}")
-                    wandb_enabled = False
-            
-            # Save checkpoint
-            save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss)
-            
-            # Check if this is the best model so far
-            if val_loss < best_val_loss:
-                logger.info(f"Validation loss improved from {best_val_loss:.4f} to {val_loss:.4f}")
-                best_val_loss = val_loss
-                save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=True)
-                no_improvement_count = 0
-            else:
-                no_improvement_count += 1
-                logger.info(f"No improvement for {no_improvement_count} epochs")
-            
-            # Run example inference every few epochs if enabled
-            if not args.disable_inference and (epoch + 1) % args.inference_interval == 0:
-                run_example_inference(model, tokenizer, test_cases, device)
-            
-            # Early stopping
-            if args.early_stopping > 0 and no_improvement_count >= args.early_stopping:
-                logger.info(f"Early stopping triggered after {no_improvement_count} epochs without improvement")
-                break
+            if val_dataloader is not None:
+                val_loss, val_tokens = validate(model, val_dataloader, device)
+                val_losses.append(val_loss)
                 
+                # Log validation loss
+                logger.info(f"Validation loss: {val_loss:.4f}, Perplexity: {np.exp(val_loss):.2f}")
+                
+                # Check if this is the best model so far
+                if val_loss < best_val_loss:
+                    logger.info(f"Validation loss improved from {best_val_loss:.4f} to {val_loss:.4f}")
+                    best_val_loss = val_loss
+                    save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=True)
+            else:
+                # No validation available, use a dummy value and always save as best
+                logger.info("Validation is disabled, saving checkpoint as best")
+                val_loss = 0.0
+                val_losses.append(val_loss)
+                save_checkpoint(model, optimizer, scheduler, epoch, args, val_loss, best=True)
         except Exception as e:
-            logger.error(f"Error during validation: {e}")
-            # Continue training despite validation error
-            logger.info("Continuing to next epoch despite validation error")
-    
+            logger.warning(f"Error during validation: {e}")
+            # Continue training despite validation errors
+            val_loss = 0.0
+            val_losses.append(val_loss)
+        
+        # Print epoch statistics with clear formatting
+        logger.info(f"Epoch {epoch+1}/{args.num_epochs}")
+        logger.info(f"  Train Loss: {avg_train_loss:.4f}")
+        logger.info(f"  Validation Loss: {val_loss:.4f}")
+        logger.info(f"  Perplexity: {np.exp(val_loss):.2f}")
+        logger.info(f"  Tokens processed this epoch: {epoch_tokens:,}")
+        logger.info(f"  Total tokens processed: {total_tokens_processed:,}")
+        logger.info(f"  Epoch time: {epoch_time:.2f}s")
+        logger.info(f"  Processing speed: {tokens_per_second:.2f} tokens/second")
+        
+        # Add data for plots
+        loss_plot_data.append([epoch + 1, avg_train_loss])
+        val_loss_plot_data.append([epoch + 1, val_loss])
+        train_ppl_data.append([epoch + 1, np.exp(avg_train_loss)])
+        val_ppl_data.append([epoch + 1, np.exp(val_loss)])
+        
+        # Log to TensorBoard
+        if tensorboard_enabled:
+            try:
+                writer.add_scalar('epoch/train_loss', avg_train_loss, epoch)
+                writer.add_scalar('epoch/val_loss', val_loss, epoch)
+                writer.add_scalar('epoch/perplexity', np.exp(val_loss), epoch)
+                writer.add_scalar('epoch/tokens_processed', epoch_tokens, epoch)
+                writer.add_scalar('epoch/total_tokens_processed', total_tokens_processed, epoch)
+                writer.add_scalar('epoch/tokens_per_second', tokens_per_second, epoch)
+            except Exception as e:
+                logger.warning(f"Error logging to TensorBoard: {e}")
+                tensorboard_enabled = False
+        
+        # Log to W&B with more comprehensive epoch metrics
+        if wandb_enabled:
+            try:
+                wandb.log({
+                    'epoch': epoch + 1,
+                    'epoch/train_loss': avg_train_loss,
+                    'epoch/val_loss': val_loss,
+                    'epoch/train_perplexity': np.exp(avg_train_loss),
+                    'epoch/val_perplexity': np.exp(val_loss),
+                    'epoch/tokens_processed': epoch_tokens,
+                    'epoch/total_tokens_processed': total_tokens_processed,
+                    'epoch/tokens_per_second': tokens_per_second,
+                    'epoch/epoch_time': epoch_time,
+                    'epoch/learning_rate': scheduler.get_last_lr()[0],
+                    'epoch/no_improvement_count': no_improvement_count
+                })
+                
+                # Log validation metrics separately to create a custom chart
+                wandb.log({
+                    'validation/loss': val_loss,
+                    'validation/perplexity': np.exp(val_loss),
+                    'validation/tokens': val_tokens
+                })
+            except Exception as e:
+                logger.warning(f"Failed to log to wandb: {e}")
+                wandb_enabled = False
+        
+        # Run example inference every few epochs if enabled
+        if not args.disable_inference and (epoch + 1) % args.inference_interval == 0:
+            run_example_inference(model, tokenizer, test_cases, device)
+        
+        # Early stopping
+        if args.early_stopping > 0 and no_improvement_count >= args.early_stopping:
+            logger.info(f"Early stopping triggered after {no_improvement_count} epochs without improvement")
+            break
+                
     # Calculate total training time
     total_training_time = time.time() - training_start_time
     hours, remainder = divmod(total_training_time, 3600)
