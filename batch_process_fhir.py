@@ -7,6 +7,8 @@ from data_processing import parse_fhir_bundle
 from pathlib import Path
 import argparse
 import logging
+import multiprocessing
+from functools import partial
 
 # Set up logging
 logging.basicConfig(
@@ -19,9 +21,74 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def process_single_file(json_file, temp_dir, required_columns):
+    """
+    Process a single FHIR JSON file and return the claims DataFrame.
+    
+    Args:
+        json_file (str): Path to the FHIR JSON file
+        temp_dir (str): Directory to save temporary processed files
+        required_columns (list): List of columns to keep in the DataFrame
+        
+    Returns:
+        pd.DataFrame or None: Claims DataFrame if successful, None otherwise
+    """
+    file_name = os.path.basename(json_file)
+    temp_file = os.path.join(temp_dir, f"{file_name}.processed")
+    temp_tsv = os.path.join(temp_dir, f"{file_name}.tsv")
+    
+    try:
+        # Parse the FHIR Bundle
+        dfs = parse_fhir_bundle(json_file)
+        
+        # Check if claims data was extracted
+        if "claims" in dfs and not dfs["claims"].empty:
+            claims_df = dfs["claims"]
+            
+            # Filter to include only the required columns if they exist
+            existing_columns = [col for col in required_columns if col in claims_df.columns]
+            claims_df = claims_df[existing_columns]
+            
+            # Save individual file's claims to temp directory for incremental processing
+            claims_df.to_csv(temp_tsv, sep='\t', index=False)
+            
+            # Create an empty file to mark this file as processed
+            with open(temp_file, 'w') as f:
+                pass
+                
+            return claims_df
+        else:
+            logger.warning(f"No claims data found in {file_name}")
+            return None
+    except Exception as e:
+        logger.error(f"Error processing {file_name}: {e}")
+        return None
+
+def load_processed_file(temp_tsv, required_columns):
+    """
+    Load a previously processed temp file.
+    
+    Args:
+        temp_tsv (str): Path to the temp TSV file
+        required_columns (list): List of columns to keep in the DataFrame
+        
+    Returns:
+        pd.DataFrame or None: Claims DataFrame if successful, None otherwise
+    """
+    try:
+        claims_df = pd.read_csv(temp_tsv, sep='\t')
+        # Filter to include only the required columns if they exist
+        existing_columns = [col for col in required_columns if col in claims_df.columns]
+        claims_df = claims_df[existing_columns]
+        return claims_df
+    except Exception as e:
+        logger.error(f"Error loading {temp_tsv}: {e}")
+        return None
+
 def process_all_fhir_files(input_dir, output_file, skip_processed=False):
     """
     Process all FHIR JSON files in the input directory and save the combined claims data to a TSV file.
+    Uses multiprocessing to parallelize the processing.
     
     Args:
         input_dir (str): Directory containing FHIR JSON files
@@ -42,70 +109,66 @@ def process_all_fhir_files(input_dir, output_file, skip_processed=False):
     json_files = glob.glob(os.path.join(input_dir, "*.json"))
     logger.info(f"Found {len(json_files)} JSON files to process")
     
-    # Initialize an empty list to store all the claim DataFrames
-    all_claims_dfs = []
+    # Define the columns we want to keep
+    required_columns = [
+        "claim_type", "days_of_service", "product_service_display",
+        "claim_amount", "encounter_class", "encounter_reason",
+        "gender", "age"
+    ]
     
-    # Process each JSON file
-    for json_file in tqdm(json_files, desc="Processing FHIR files"):
+    # Files to process
+    files_to_process = []
+    previously_processed_dfs = []
+    
+    # Identify which files to process and which to load from temp
+    for json_file in json_files:
         file_name = os.path.basename(json_file)
         temp_file = os.path.join(temp_dir, f"{file_name}.processed")
+        temp_tsv = os.path.join(temp_dir, f"{file_name}.tsv")
         
-        # Skip if already processed and skip_processed is True
-        if skip_processed and os.path.exists(temp_file):
-            logger.info(f"Skipping already processed file: {file_name}")
-            
-            # Load the previously processed file
-            temp_tsv = os.path.join(temp_dir, f"{file_name}.tsv")
-            if os.path.exists(temp_tsv):
-                try:
-                    claims_df = pd.read_csv(temp_tsv, sep='\t')
-                    # Filter to include only the required columns if they exist
-                    required_columns = [
-                        "claim_type", "days_of_service", "product_service_display",
-                        "claim_amount", "encounter_class", "encounter_reason",
-                        "gender", "age"
-                    ]
-                    existing_columns = [col for col in required_columns if col in claims_df.columns]
-                    claims_df = claims_df[existing_columns]
-                    all_claims_dfs.append(claims_df)
-                    logger.info(f"Loaded {len(claims_df)} claims from {temp_tsv}")
-                except Exception as e:
-                    logger.error(f"Error loading {temp_tsv}: {e}")
-            
-            continue
+        if skip_processed and os.path.exists(temp_file) and os.path.exists(temp_tsv):
+            # Load previously processed file
+            logger.info(f"Loading previously processed file: {file_name}")
+            claims_df = load_processed_file(temp_tsv, required_columns)
+            if claims_df is not None:
+                previously_processed_dfs.append(claims_df)
+        else:
+            # Add to list of files to process
+            files_to_process.append(json_file)
+    
+    logger.info(f"Loaded {len(previously_processed_dfs)} previously processed files")
+    logger.info(f"Processing {len(files_to_process)} new files with multiprocessing")
+    
+    # Use multiprocessing to process files in parallel
+    if files_to_process:
+        # Get number of cores
+        num_cores = multiprocessing.cpu_count()
+        logger.info(f"Using {num_cores} CPU cores for parallel processing")
         
-        try:
-            # Parse the FHIR Bundle
-            logger.info(f"Processing {file_name}")
-            dfs = parse_fhir_bundle(json_file)
-            
-            # Check if claims data was extracted
-            if "claims" in dfs and not dfs["claims"].empty:
-                claims_df = dfs["claims"]
-                
-                # Filter to include only the required columns if they exist
-                required_columns = [
-                    "claim_type", "days_of_service", "product_service_display",
-                    "claim_amount", "encounter_class", "encounter_reason",
-                    "gender", "age"
-                ]
-                existing_columns = [col for col in required_columns if col in claims_df.columns]
-                claims_df = claims_df[existing_columns]
-                
-                all_claims_dfs.append(claims_df)
-                
-                # Save individual file's claims to temp directory for incremental processing
-                temp_tsv = os.path.join(temp_dir, f"{file_name}.tsv")
-                claims_df.to_csv(temp_tsv, sep='\t', index=False)
-                logger.info(f"Extracted {len(claims_df)} claims from {file_name}")
-                
-                # Create an empty file to mark this file as processed
-                with open(temp_file, 'w') as f:
-                    pass
-            else:
-                logger.warning(f"No claims data found in {file_name}")
-        except Exception as e:
-            logger.error(f"Error processing {file_name}: {e}")
+        # Create a partial function with fixed arguments
+        process_file_partial = partial(
+            process_single_file, 
+            temp_dir=temp_dir, 
+            required_columns=required_columns
+        )
+        
+        # Create a pool of workers and process files in parallel
+        with multiprocessing.Pool(processes=num_cores) as pool:
+            # Process files in parallel and show progress with tqdm
+            results = list(tqdm(
+                pool.imap(process_file_partial, files_to_process),
+                total=len(files_to_process),
+                desc="Processing FHIR files"
+            ))
+        
+        # Filter out None results
+        processed_dfs = [df for df in results if df is not None]
+        logger.info(f"Successfully processed {len(processed_dfs)} new files")
+        
+        # Combine with previously processed DataFrames
+        all_claims_dfs = previously_processed_dfs + processed_dfs
+    else:
+        all_claims_dfs = previously_processed_dfs
     
     # Combine all DataFrames
     if all_claims_dfs:
