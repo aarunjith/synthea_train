@@ -59,6 +59,14 @@ def process_all_fhir_files(input_dir, output_file, skip_processed=False):
             if os.path.exists(temp_tsv):
                 try:
                     claims_df = pd.read_csv(temp_tsv, sep='\t')
+                    # Filter to include only the required columns if they exist
+                    required_columns = [
+                        "claim_type", "days_of_service", "product_service_display",
+                        "claim_amount", "encounter_class", "encounter_reason",
+                        "gender", "age"
+                    ]
+                    existing_columns = [col for col in required_columns if col in claims_df.columns]
+                    claims_df = claims_df[existing_columns]
                     all_claims_dfs.append(claims_df)
                     logger.info(f"Loaded {len(claims_df)} claims from {temp_tsv}")
                 except Exception as e:
@@ -74,6 +82,16 @@ def process_all_fhir_files(input_dir, output_file, skip_processed=False):
             # Check if claims data was extracted
             if "claims" in dfs and not dfs["claims"].empty:
                 claims_df = dfs["claims"]
+                
+                # Filter to include only the required columns if they exist
+                required_columns = [
+                    "claim_type", "days_of_service", "product_service_display",
+                    "claim_amount", "encounter_class", "encounter_reason",
+                    "gender", "age"
+                ]
+                existing_columns = [col for col in required_columns if col in claims_df.columns]
+                claims_df = claims_df[existing_columns]
+                
                 all_claims_dfs.append(claims_df)
                 
                 # Save individual file's claims to temp directory for incremental processing
