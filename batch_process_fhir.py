@@ -9,6 +9,7 @@ import argparse
 import logging
 import multiprocessing
 from functools import partial
+import numpy as np
 
 # Set up logging
 logging.basicConfig(
@@ -178,6 +179,10 @@ def process_all_fhir_files(input_dir, output_file, skip_processed=False):
         # Remove duplicate rows
         combined_df = combined_df.drop_duplicates()
         logger.info(f"After removing duplicates: {len(combined_df)} claims")
+        
+        # Shuffle the data for randomization
+        combined_df = combined_df.sample(frac=1, random_state=42).reset_index(drop=True)
+        logger.info("Shuffled data for randomization")
         
         # Save to TSV file
         combined_df.to_csv(output_file, sep='\t', index=False)
